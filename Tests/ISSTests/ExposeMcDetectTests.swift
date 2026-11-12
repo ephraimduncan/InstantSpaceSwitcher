@@ -9,6 +9,10 @@ private func iss_is_expose_detected_in_window_list(_ windowList: CFArray) -> Boo
 
 @_silgen_name("iss_is_mission_control_detected_in_window_list")
 private func iss_is_mission_control_detected_in_window_list(_ windowList: CFArray) -> Bool
+
+@_silgen_name("iss_is_overlay_detected_in_window_list")
+private func iss_is_overlay_detected_in_window_list(
+    _ windowList: CFArray, _ displayBounds: UnsafePointer<CGRect>?, _ displayCount: UInt32) -> Bool
 //
 // Window structures are hardcoded from real probe output (expose_probe.c) captured
 // on macOS Sequoia with two displays (1920x1080 primary, 1728x1117 secondary).
@@ -234,5 +238,46 @@ final class OverlayDetectionTests: XCTestCase {
         ]
         XCTAssertTrue(iss_is_expose_detected_in_window_list(list as CFArray), "should detect App Exposé on single display")
         XCTAssertFalse(iss_is_mission_control_detected_in_window_list(list as CFArray))
+    }
+
+    // MARK: - Any overlay
+    // macOS 27.0, dual display (2048x1152 primary, built-in secondary).
+    // Mission Control is one layer-20 Dock window that covers the primary display.
+
+    private let displays = [
+        CGRect(x: 0, y: 0, width: 2048, height: 1152),
+        CGRect(x: -1512, y: 0, width: 1512, height: 982),
+    ]
+
+    private func overlayDetected(_ list: NSArray) -> Bool {
+        displays.withUnsafeBufferPointer {
+            iss_is_overlay_detected_in_window_list(list as CFArray, $0.baseAddress, UInt32($0.count))
+        }
+    }
+
+    func testOverlayDetectedOnMacOS27MissionControl() {
+        let list: NSArray = [
+            dockWindow(layer: 20, x: 0, y: 0, width: 2048, height: 1152),
+        ]
+        XCTAssertTrue(overlayDetected(list))
+    }
+
+    func testOverlayNotDetectedForDockBar() {
+        let list: NSArray = [
+            dockWindow(layer: 20, x: 0, y: 1060, width: 2048, height: 92),
+        ]
+        XCTAssertFalse(overlayDetected(list))
+    }
+
+    func testOverlayDetectedBeforeMacOS27() {
+        let list: NSArray = [
+            dockWindow(layer: 20, x: 0, y: 0, width: 233, height: 86),
+            dockWindow(layer: 18, x: 0, y: 0, width: 1920, height: 1080),
+        ]
+        XCTAssertTrue(overlayDetected(list))
+    }
+
+    func testOverlayNotDetectedWhenIdle() {
+        XCTAssertFalse(overlayDetected([]))
     }
 }
