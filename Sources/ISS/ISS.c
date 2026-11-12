@@ -133,6 +133,7 @@ static bool load_space_info_for_display(ISSSpaceInfo *info, bool useCursorDispla
 static bool iss_perform_switch_gesture(ISSDirection direction, double velocity);
 static bool iss_switch_with_info(const ISSSpaceInfo *info, ISSDirection direction);
 static bool iss_should_block_switch(const ISSSpaceInfo *info, ISSDirection direction);
+static bool dock_overlay_active(void);
 
 static ISSDirection iss_direction_from_gesture_value(double value) {
     // Map the intercepted gesture value to the app's logical direction.
@@ -166,8 +167,12 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     // Re-enable if the system disabled our tap for being too slow
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         if (globalTap) CGEventTapEnable(globalTap, true);
-        // Anything we posted while disabled never reaches us, so stop waiting for it
+        // Anything we posted while disabled never reaches us, so stop waiting for it.
+        // The ended event of a swipe in progress went straight to the Dock, so stop
+        // tracking it too, or we keep eating every other trackpad gesture.
         syntheticEventsToPassThrough = 0;
+        swipeTracking = false;
+        swipeFired = false;
         return event;
     }
 
@@ -209,7 +214,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
 
         switch (phase) {
         case kCGSGesturePhaseBegan:
-            if (iss_is_expose_active()) return event;
+            // Let the Dock move between spaces inside Mission Control and App Exposé
+            if (dock_overlay_active()) return event;
             swipeTracking = true;
             swipeFired = false;
             return NULL;
@@ -679,6 +685,71 @@ bool iss_is_mission_control_active(void) {
     return result;
 }
 
+static bool dock_window_covers_display(CFDictionaryRef info,
+                                       const CGRect *displayBounds,
+                                       uint32_t displayCount) {
+    CFDictionaryRef boundsDict = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+    CGRect bounds;
+    if (!boundsDict || !CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < displayCount; i++) {
+        if (CGRectEqualToRect(bounds, displayBounds[i])) return true;
+    }
+    return false;
+}
+
+/// True while Mission Control or App Exposé is on screen. Before macOS 27 both
+/// add layer-18 Dock windows. macOS 27 draws them in a single layer-20 Dock
+/// window that covers the display, and adds no layer-18 windows.
+bool iss_is_overlay_detected_in_window_list(CFArrayRef windowList,
+                                            const CGRect *displayBounds,
+                                            uint32_t displayCount) {
+    int layer18Count = 0;
+    int layer20Count = 0;
+    scan_dock_window_list(windowList, &layer18Count, &layer20Count);
+    if (layer18Count > 0) {
+        return layer20Count > 0;
+    }
+
+    CFIndex count = CFArrayGetCount(windowList);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
+        CFStringRef owner = (CFStringRef)CFDictionaryGetValue(info, kCGWindowOwnerName);
+        if (!owner || !CFEqual(owner, CFSTR("Dock"))) continue;
+        int layer = 0;
+        CFNumberRef layerNum = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowLayer);
+        if (layerNum) {
+            CFNumberGetValue(layerNum, kCFNumberIntType, &layer);
+        }
+        if (layer == 20 && dock_window_covers_display(info, displayBounds, displayCount)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dock_overlay_active(void) {
+    if (!overlayDetectionEnabled) return false;
+
+    CGDirectDisplayID displays[16];
+    uint32_t displayCount = 0;
+    if (CGGetActiveDisplayList(16, displays, &displayCount) != kCGErrorSuccess) {
+        displayCount = 0;
+    }
+    CGRect displayBounds[16];
+    for (uint32_t i = 0; i < displayCount; i++) {
+        displayBounds[i] = CGDisplayBounds(displays[i]);
+    }
+
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+    if (!windowList) return false;
+    bool result = iss_is_overlay_detected_in_window_list(windowList, displayBounds, displayCount);
+    CFRelease(windowList);
+    return result;
+}
+
 void iss_set_overlay_detection_enabled(bool enabled) {
     overlayDetectionEnabled = enabled;
 }
@@ -692,8 +763,7 @@ bool iss_init(void) {
         predictionsDict = CFDictionaryCreateMutable(NULL, 0, &kCFCopyStringDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     }
 
-    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
-        | (1ULL << kCGSEventGesture) | (1ULL << kCGSEventDockControl);
+    CGEventMask mask = (1ULL << kCGSEventGesture) | (1ULL << kCGSEventDockControl);
     globalTap = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
